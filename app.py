@@ -9,7 +9,11 @@ import base64
 from time import sleep
 import threading
 import smbus
+import time
+import pigpio
 
+pi = pigpio.pi()
+pi.write(13, 0)
 
 
 class SoilMoist:
