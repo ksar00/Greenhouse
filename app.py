@@ -12,7 +12,6 @@ import threading
 import smbus
 import time
 import pigpio
-from yolo_predict import copy_and_rename_pathlib, prediction
 
 
 LED_GPIO_RED = 12
@@ -63,9 +62,9 @@ class ADC:
         return data
 
 class LDR:
-    def __init__(self):
-        self.light_value = None 
-        self.adc = ADC(0x48) # Composition
+    def __init__(self, i2c_addr=0x48):
+            self.i2c_addr = i2c_addr
+            self.bus = smbus.SMBus(1)
     
     def continous_measure(self):
         while True:
@@ -81,7 +80,7 @@ ldr.start_continous_measure()
 
 
 class SoilMoist:
-    def __init__(self, dry=779, wet=297, i2c_addr=0x4B):
+    def __init__(self, dry=779, wet=297, i2c_addr=0x4b):
         self.dry = dry
         self.wet = wet
         self.soil_moisture_percent = None
@@ -110,7 +109,13 @@ class SoilMoist:
                 data = 0
         if data < 10:
             print(f"Soil is dry and at {data}% moisture!")
+
+        
+    
         return data
+    
+    
+
     
     def select_soil_percentage(self, amount):
         if isinstance(amount, int) and amount > 0:
@@ -149,7 +154,7 @@ soil_measure.insert_soilmoisture()
 
 
 @socketio.on('skru_roed')
-    def skru_roed(data):
+def skru_roed(data):
         lysstyrke_roed = int(data['lysstyrke_roed'])
 
         if lysstyrke_roed < 0:
@@ -161,7 +166,7 @@ soil_measure.insert_soilmoisture()
         pi.set_PWM_dutycycle(LED_GPIO_RED, lysstyrke_roed)
 
 @socketio.on('skru_blaa')
-    def skru_blaa(data):
+def skru_blaa(data):
         lysstyrke_blaa = int(data['lysstyrke_blaa'])
 
         if lysstyrke_blaa < 0:
@@ -214,14 +219,6 @@ def take_photo():
     return redirect(url_for("home"))
 
 
-@app.route("/predict_last_photo/")
-def predict_last_photo():
-    # hent sidste billede
-    last_photo = select_images(1)[0][0]
-    # prediction på sidste billede
-    prediction(last_photo)
-    # laver et redirect tilbage til home når billedet er taget
-    return redirect(url_for("home", predicted = True)) # argument bruges til at vise predicted billede
 
 @app.route("/")
 def home():
