@@ -1,4 +1,5 @@
 from flask import Flask, render_template, redirect, url_for
+from flask_socketio import SocketIO, emit
 import libcamera
 from picamera2 import Picamera2, Preview
 from datetime import datetime
@@ -11,9 +12,72 @@ import threading
 import smbus
 import time
 import pigpio
+from yolo_predict import copy_and_rename_pathlib, prediction
+
+
+LED_GPIO_RED = 12
+LED_GPIO_BLUE = 13
+PUMP_GPIO = 17
 
 pi = pigpio.pi()
-pi.write(13, 0)
+pi.set_PWM_frequency(LED_GPIO_RED, 10000)
+pi.set_PWM_range(LED_GPIO_RED, 100) 
+pi.set_PWM_frequency(LED_GPIO_BLUE, 10000)
+pi.set_PWM_range(LED_GPIO_BLUE, 100) 
+pi.set_PWM_dutycycle(LED_GPIO_BLUE, 0)
+pi.set_PWM_dutycycle(LED_GPIO_RED, 0)
+pi.set_mode(LED_GPIO_RED, pigpio.OUTPUT)
+pi.set_mode(LED_GPIO_BLUE, pigpio.OUTPUT)
+if pi.get_PWM_dutycycle(LED_GPIO_RED) > 40 or pi.get_PWM_dutycycle(LED_GPIO_BLUE) > 30:
+    pi.set_PWM_dutycycle(LED_GPIO_RED, 30)
+    pi.set_PWM_dutycycle(LED_GPIO_BLUE, 40)
+    
+app = Flask(__name__)
+socketio = SocketIO(app)
+
+class WaterPump:
+    def __init__(self, PUMP_GPIO_PIN=17):
+        self.PUMP_GPIO_PIN = PUMP_GPIO_PIN # der står 38 på adapter
+        self.pump_running = False
+    
+    def water_plants(self, duration_seconds):
+        self.pump_running = True
+        pi.write(self.PUMP_GPIO_PIN, 1)
+        sleep(duration_seconds)
+        pi.write(self.PUMP_GPIO_PIN, 0)
+        self.pump_running = False
+
+class ADC:
+    def __init__(self, i2c_addr=0x4b):
+            self.i2c_addr = i2c_addr
+            self.bus = smbus.SMBus(1)
+    
+    def raw_adc(self):
+        # Reads word (2 bytes) as int - 0 is comm byte​
+        rd = self.bus.read_word_data(self.i2c_addr, 0)
+        # Exchanges high and low bytes​
+        data = ((rd & 0xFF) << 8) | ((rd & 0xFF00) >> 8)
+        # Ignores two least significiant bits​
+        data = data >> 2
+        #print(data)
+        return data
+
+class LDR:
+    def __init__(self):
+        self.light_value = None 
+        self.adc = ADC(0x48) # Composition
+    
+    def continous_measure(self):
+        while True:
+            self.light_value = self.adc.raw_adc()
+            sleep(0.2)
+
+    def start_continous_measure(self):
+        soil_thread = threading.Thread(target=self.continous_measure)
+        soil_thread.start()
+
+ldr = LDR()
+ldr.start_continous_measure()
 
 
 class SoilMoist:
@@ -84,6 +148,30 @@ soil_measure = SoilMoist()
 soil_measure.insert_soilmoisture()
 
 
+@socketio.on('skru_roed')
+    def skru_roed(data):
+        lysstyrke_roed = int(data['lysstyrke_roed'])
+
+        if lysstyrke_roed < 0:
+            lysstyrke_roed = 0
+
+        if lysstyrke_roed > 60:
+            lysstyrke_roed = 60
+        print(f"rød: {lysstyrke_roed}")
+        pi.set_PWM_dutycycle(LED_GPIO_RED, lysstyrke_roed)
+
+@socketio.on('skru_blaa')
+    def skru_blaa(data):
+        lysstyrke_blaa = int(data['lysstyrke_blaa'])
+
+        if lysstyrke_blaa < 0:
+            lysstyrke_blaa = 0
+
+        if lysstyrke_blaa > 60:
+            lysstyrke_blaa = 60
+        print(f"blå: {lysstyrke_blaa}")
+        pi.set_PWM_dutycycle(LED_GPIO_BLUE, lysstyrke_blaa)
+
 def select_images(amount):
     if isinstance(amount, int) and amount > 0:
         con = Connection('greenhouse.db')
@@ -118,33 +206,22 @@ def take_picture():
 
 take_picture()
 
-app = Flask(__name__)
-
-@app.route("/soil/")
-def soil():
-    soil_data = soil_measure.select_soil_percentage(10)
-    fig = Figure()
-    ax = fig.subplots()
-    x = []
-    y = []
-    ax.tick_params(axis='x', which='both', rotation=30)
-    fig.subplots_adjust(bottom=0.3)
-    ax.set_xlabel("Timestamps")
-    ax.set_ylabel("Soilmoisture %")
-    for row in soil_data:
-        x.append(row[1]) #timestamp
-        y.append(row[0]) # moisture percentage
-    ax.plot(x, y)
-    buf = BytesIO()
-    fig.savefig(buf, format="png")
-    data = base64.b64encode(buf.getbuffer()).decode("ascii")
-    return render_template("soil.html", soil_data = data)
 
 
 @app.route("/take_photo/")
 def take_photo():
     take_picture
     return redirect(url_for("home"))
+
+
+@app.route("/predict_last_photo/")
+def predict_last_photo():
+    # hent sidste billede
+    last_photo = select_images(1)[0][0]
+    # prediction på sidste billede
+    prediction(last_photo)
+    # laver et redirect tilbage til home når billedet er taget
+    return redirect(url_for("home", predicted = True)) # argument bruges til at vise predicted billede
 
 @app.route("/")
 def home():
@@ -158,6 +235,72 @@ def gallery():
 @app.route("/site2/")
 def site2():
     return render_template("site2.html")
+
+@app.route("/soil_history/")
+def soil_history():
+    soil_data = soil_measure.select_soil_percentage(10)
+    # Generate the figure **without using pyplot**.
+    fig = Figure()
+    ax = fig.subplots()
+    x = []
+    y = []
+    ax.tick_params(axis='x', which='both', rotation=30)
+    fig.subplots_adjust(bottom=0.3)
+    ax.set_xlabel("Timestamps")
+    ax.set_ylabel("Soilmoisture %")
+    for row in soil_data:
+        x.append(row[1]) # timestamp
+        y.append(row[0]) # moisture percentage
+    ax.plot(x, y)
+    # Save it to a temporary buffer.
+    buf = BytesIO()
+    fig.savefig(buf, format="png")
+    # Embed the result in the html output.
+    data = base64.b64encode(buf.getbuffer()).decode("ascii")
+    return render_template("soil_history.html", soil_data = data)
+
+@app.route("/manual_light/")
+def manual_light():
+    return render_template("manual_light.html", methods=['GET'])
+
+@socketio.on('hent_soil')
+def hent_soil():
+    sleep(0.5)
+    data = {"moist_percentage":soil_measure.soil_moisture_percent,
+            "pump_state": soil_measure.water_pump.pump_running
+            }
+    socketio.emit('soil', data)
+    
+@app.route("/soil_live/")
+def soil_live():
+    return render_template("soil_live.html", methods=['GET'])
+
+@socketio.on('hent_ldr')
+def hent_soil():
+    #print(ldr.light_value)
+    sleep(0.5)
+    data = {"ldr":ldr.light_value,
+            }
+    socketio.emit('ldr', data)
+    
+@app.route("/ldr_live/")
+def ldr_live():
+    return render_template("ldr_live.html", methods=['GET'])
+
+@socketio.on('start_pump')
+def start_pump():
+    try:
+        print("Starting pump for 1 second")
+        data = {"pump_state": True}
+        socketio.emit('pump', data)
+        soil_measure.water_pump.water_plants(1)
+        data = {"pump_state": False}
+        socketio.emit('pump', data)
+        # the pump gives aproximately 200 mililiters of water per 10 seconds
+        print("Stopped pump again!")
+    except:
+        print("Something went wrong, stopping pump")
+        pi.write(PUMP_GPIO, 0)
 
 if __name__ == ('__main__'):
     app.run(host="0.0.0.0", debug=True)
